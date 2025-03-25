@@ -1,6 +1,5 @@
-import re
 import logging
-from calendar import different_locale
+import re
 from urllib.parse import urljoin
 
 import requests_cache
@@ -8,9 +7,16 @@ from bs4 import BeautifulSoup
 from tqdm import tqdm
 
 from configs import configure_argument_parser, configure_logging
-from constants import BASE_DIR, EXPECTED_STATUS, MAIN_DOC_URL, PEPS_URL, PEP_SECTIONS
+from constants import (
+    BASE_DIR,
+    EXPECTED_STATUS,
+    MAIN_DOC_URL,
+    PEPS_URL,
+    PEP_SECTIONS
+)
 from outputs import control_output
 from utils import get_response, find_tag
+
 
 def whats_new(session):
     whats_new_url = urljoin(MAIN_DOC_URL, 'whatsnew/')
@@ -20,7 +26,9 @@ def whats_new(session):
     soup = BeautifulSoup(response.text, features='lxml')
     main_div = find_tag(soup, 'section', attrs={'id': 'what-s-new-in-python'})
     div_with_ul = main_div.find('div', attrs={'class': 'toctree-wrapper'})
-    sections_by_python = div_with_ul.find_all('li', attrs={'class': 'toctree-l1'})
+    sections_by_python = div_with_ul.find_all(
+        'li', attrs={'class': 'toctree-l1'}
+    )
     results = [('Ссылка на статью', 'Заголовок', 'Редактор, автор')]
     for section in tqdm(sections_by_python):
         version_a_tag = section.find('a')
@@ -65,13 +73,14 @@ def latest_versions(session):
 
     return results
 
+
 def download(session):
     downloads_url = urljoin(MAIN_DOC_URL, 'download.html')
     response = get_response(session, downloads_url)
     if response is None:
         return
     soup = BeautifulSoup(response.text, 'lxml')
-    tabel = find_tag(soup, 'table', attrs={'class':'docutils'})
+    tabel = find_tag(soup, 'table', attrs={'class': 'docutils'})
     pdf_a4_tag = tabel.find('a', {'href': re.compile(r'.+pdf-a4\.zip$')})
     pdf_a4_link = pdf_a4_tag['href']
     archive_url = urljoin(downloads_url, pdf_a4_link)
@@ -84,8 +93,31 @@ def download(session):
         file.write(response.content)
     logging.info(f'Архив был загружен и сохранён: {archive_path}')
 
+
 def pep(session):
-    status_counter = {
+    status_counter = initialize_status_counter()
+    response = get_response(session, PEPS_URL)
+    if response is None:
+        return
+    soup = BeautifulSoup(response.text, 'lxml')
+    different_statuses = []
+    results = [('Категория', 'Статус')]
+
+    for section in PEP_SECTIONS:
+        process_section(section, soup, session, status_counter,
+                        different_statuses, results)
+
+    log_different_statuses(different_statuses)
+
+    for i in status_counter.items():
+        results.append(i)
+    results.append(('Всего', len(status_counter)))
+
+    return results
+
+
+def initialize_status_counter():
+    return {
         'Accepted': 0,
         'Active': 0,
         'Deferred': 0,
@@ -96,43 +128,69 @@ def pep(session):
         'Superseded': 0,
         'Withdrawn': 0,
     }
-    response = get_response(session, PEPS_URL)
-    if response is None:
+
+
+def process_section(section, soup, session, status_counter, different_statuses,
+                    results):
+    content = soup.find('section', attrs={'id': section})
+    if not content:
         return
+
+    table_string = content.find_all('tr')
+    for row in tqdm(table_string):
+        process_row(row, session, status_counter, different_statuses)
+
+
+def process_row(row, session, status_counter, different_statuses):
+    table_status = get_table_status(row)
+    link = row.find('a', attrs={'class': 'pep reference internal'})
+
+    if link:
+        pep_url = urljoin(PEPS_URL, link['href'])
+        page_status = get_page_status(session, pep_url)
+        update_status_counter(page_status, status_counter)
+        check_status_mismatch(page_status, table_status, pep_url,
+                              different_statuses)
+
+
+def get_table_status(row):
+    table_status = row.find('td')
+    if table_status and len(table_status.text) > 1:
+        return table_status.text[-1]
+    return ''
+
+
+def get_page_status(session, pep_url):
+    response = get_response(session, pep_url)
     soup = BeautifulSoup(response.text, 'lxml')
-    different_statuses = []
-    for section in PEP_SECTIONS:
-        content = soup.find('section', attrs={'id': section})
-        if content:
-            table_string = content.find_all('tr')
-            for row in tqdm(table_string):
-                table_status = row.find('td')
-                if table_status:
-                    if len(table_status.text) == 1:
-                        table_status = ''
-                    else:
-                        table_status = table_status.text[-1]
-                link = row.find('a', attrs={'class':'pep reference internal'})
-                if link:
-                    pep_url = urljoin(PEPS_URL, link['href'])
-                    response = get_response(session, pep_url)
-                    soup = BeautifulSoup(response.text, 'lxml')
-                    page_status = soup.find('abbr')
-                    try:
-                        status_counter[page_status.text] += 1
-                    except KeyError:
-                        error_msg = f'Неcуществующий статус: {page_status.text}'
-                        logging.error(error_msg)
-                    if page_status.text not in EXPECTED_STATUS[table_status]:
-                        different_statuses.append(
-                            f'{pep_url}\nСтатус в карточке: {page_status.text}\nОжидаевые статусы: {EXPECTED_STATUS[table_status]}'
-                        )
-            print(f'Всего {len(table_string)} статусов')
-            print(f'Статусы по категориям {status_counter}')
-            error_msg = f'Несовпадающие статусы:'
-            for err in different_statuses:
-                error_msg += f'\n{err}'
-            logging.error(error_msg)
+    return soup.find('abbr')
+
+
+def update_status_counter(page_status, status_counter):
+    try:
+        status_counter[page_status.text] += 1
+    except KeyError:
+        logging.error(f'Неcуществующий статус: {page_status.text}')
+
+
+def check_status_mismatch(page_status, table_status, pep_url,
+                          different_statuses):
+    if page_status.text not in EXPECTED_STATUS.get(table_status, []):
+        different_statuses.append(
+            (
+                f'{pep_url}\nСтатус в карточке: {page_status.text}'
+                f'\nОжидаемые статусы: {EXPECTED_STATUS[table_status]}'
+            )
+        )
+
+
+def log_different_statuses(different_statuses):
+    if different_statuses:
+        error_msg = 'Несовпадающие статусы:'
+        for err in different_statuses:
+            error_msg += f'\n{err}'
+        logging.error(error_msg)
+
 
 MODE_TO_FUNCTION = {
     'whats-new': whats_new,
@@ -140,6 +198,7 @@ MODE_TO_FUNCTION = {
     'download': download,
     'pep': pep,
 }
+
 
 def main():
     configure_logging()
