@@ -1,14 +1,14 @@
 import re
 import logging
+from calendar import different_locale
 from urllib.parse import urljoin
 
 import requests_cache
 from bs4 import BeautifulSoup
-# from django.db.models.expressions import result
 from tqdm import tqdm
 
 from configs import configure_argument_parser, configure_logging
-from constants import BASE_DIR, MAIN_DOC_URL, PEPS_URL
+from constants import BASE_DIR, EXPECTED_STATUS, MAIN_DOC_URL, PEPS_URL, PEP_SECTIONS
 from outputs import control_output
 from utils import get_response, find_tag
 
@@ -85,11 +85,54 @@ def download(session):
     logging.info(f'Архив был загружен и сохранён: {archive_path}')
 
 def pep(session):
+    status_counter = {
+        'Accepted': 0,
+        'Active': 0,
+        'Deferred': 0,
+        'Draft': 0,
+        'Final': 0,
+        'Provisional': 0,
+        'Rejected': 0,
+        'Superseded': 0,
+        'Withdrawn': 0,
+    }
     response = get_response(session, PEPS_URL)
     if response is None:
         return
     soup = BeautifulSoup(response.text, 'lxml')
-
+    different_statuses = []
+    for section in PEP_SECTIONS:
+        content = soup.find('section', attrs={'id': section})
+        if content:
+            table_string = content.find_all('tr')
+            for row in tqdm(table_string):
+                table_status = row.find('td')
+                if table_status:
+                    if len(table_status.text) == 1:
+                        table_status = ''
+                    else:
+                        table_status = table_status.text[-1]
+                link = row.find('a', attrs={'class':'pep reference internal'})
+                if link:
+                    pep_url = urljoin(PEPS_URL, link['href'])
+                    response = get_response(session, pep_url)
+                    soup = BeautifulSoup(response.text, 'lxml')
+                    page_status = soup.find('abbr')
+                    try:
+                        status_counter[page_status.text] += 1
+                    except KeyError:
+                        error_msg = f'Неcуществующий статус: {page_status.text}'
+                        logging.error(error_msg)
+                    if page_status.text not in EXPECTED_STATUS[table_status]:
+                        different_statuses.append(
+                            f'{pep_url}\nСтатус в карточке: {page_status.text}\nОжидаевые статусы: {EXPECTED_STATUS[table_status]}'
+                        )
+            print(f'Всего {len(table_string)} статусов')
+            print(f'Статусы по категориям {status_counter}')
+            error_msg = f'Несовпадающие статусы:'
+            for err in different_statuses:
+                error_msg += f'\n{err}'
+            logging.error(error_msg)
 
 MODE_TO_FUNCTION = {
     'whats-new': whats_new,
